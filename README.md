@@ -62,8 +62,3 @@ java -cp bin Main
 
 - `src/Main.java`: creates the window.
 - `src/RenderPanel.java`: the map, the ray caster, the renderer and the input handling.
-
-## Notes
-
-This is a university project kept largely as it was written. Wall heights come from the raw ray
-distance, without fisheye correction, so walls bow slightly towards the edges of a wide field of view.
