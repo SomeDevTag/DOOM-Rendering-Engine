@@ -1,12 +1,18 @@
 import java.awt.Color;
+import java.awt.Dimension;
 import java.awt.Graphics;
+import java.awt.event.FocusAdapter;
+import java.awt.event.FocusEvent;
 import java.awt.event.KeyEvent;
 import java.awt.event.KeyListener;
 import java.awt.event.MouseEvent;
 import java.awt.event.MouseListener;
 import java.awt.event.MouseMotionListener;
+import java.util.HashSet;
+import java.util.Set;
 
 import javax.swing.JPanel;
+import javax.swing.Timer;
 
 public class RenderPanel extends JPanel implements KeyListener, MouseListener, MouseMotionListener {
     class RayHit {
@@ -47,20 +53,65 @@ public class RenderPanel extends JPanel implements KeyListener, MouseListener, M
         }
     }
 
-    enum Direction {
-        FORWARD, BACK, LEFT, RIGHT
-    }
+    //---layout, in pixels: the top-down map on the left, the 3D view on the right
+    static final int MAP_SIZE = 400;
+    static final int RAY_COUNT = 300;
+    static final int COLUMN_WIDTH = 3;
+    static final int VIEW_X = MAP_SIZE;
+    static final int VIEW_WIDTH = RAY_COUNT * COLUMN_WIDTH;
+    static final int VIEW_HEIGHT = MAP_SIZE;
+    static final int HORIZON_Y = VIEW_HEIGHT / 2;
+    static final int PANEL_WIDTH = VIEW_X + VIEW_WIDTH;
+    static final int PANEL_HEIGHT = VIEW_HEIGHT;
 
-    final int GRID_SIZE = 20;
+    //---world
+    static final int GRID_SIZE = 20;
+    static final int CELL_SIZE = MAP_SIZE / GRID_SIZE;
+    static final float RENDER_DISTANCE = 10; // in cells; walls fade to black by this distance
+    static final int WALL_SHRINK_PER_CELL = 35; // wall columns lose this many pixels of height per cell of distance
+    static final double PLAYER_RADIUS = 0.05;
+
+    //---controls
+    static final double MOVE_SPEED = 3; // cells per second
+    static final double TURN_SPEED = 120; // degrees per second
+    static final double MOUSE_TURN_PER_PIXEL = 0.3; // degrees
+    static final float FOV_CHANGE = 0.05f; // change in degrees between rays per N/M press
+    static final float MIN_RAY_ANGLE_STEP = 0.05f;
+    static final int TICK_MS = 16; // about 60 updates per second
+    static final double MAX_TICK_SECONDS = 0.1; // stops a stalled tick from jumping the player
+
+    //---edge highlighting
+    static final double EDGE_THRESHOLD = 0.0003;
+    static final double INNER_CORNER_DARKEN = 0.5;
+    static final double OUTER_CORNER_BRIGHTEN = 0.05;
+    static final int INNER_CORNER_ALPHA = 200;
+
+    static final Color RAY_COLOR = new Color(50, 100, 50, 150);
+    static final Color FLOOR_COLOR = new Color(20, 20, 20, 80);
+
     int[] map;
-    int cellSize;
+    float rayAngleStep = 0.4f; // degrees between rays; the field of view is RAY_COUNT * rayAngleStep
+    double playerX = 5;
+    double playerY = 2;
+    double playerAngle = 115; // degrees, the direction the player faces (the middle of the view)
+    final Set<Integer> heldKeys = new HashSet<>();
+    long lastTickNanos = System.nanoTime();
+    int lastMouseX;
+    boolean turningWithMouse;
 
     RenderPanel() {
+        this.setPreferredSize(new Dimension(PANEL_WIDTH, PANEL_HEIGHT));
         this.setFocusable(true);
         this.addKeyListener(this);
         this.addMouseListener(this);
         this.addMouseMotionListener(this);
-        cellSize = (int) Math.floor(400 / GRID_SIZE);
+        // Forget held keys when the window loses focus, so the player doesn't keep walking.
+        this.addFocusListener(new FocusAdapter() {
+            @Override
+            public void focusLost(FocusEvent e) {
+                heldKeys.clear();
+            }
+        });
         map = new int[GRID_SIZE * GRID_SIZE];
         // Start with an empty room surrounded by walls.
         for (int i = 0; i < GRID_SIZE; i++) {
@@ -71,19 +122,8 @@ public class RenderPanel extends JPanel implements KeyListener, MouseListener, M
                     map[(j * GRID_SIZE) + i] = 0;
             }
         }
+        new Timer(TICK_MS, e -> tick()).start();
     }
-
-    float rayAngleStep = 0.4f; // degrees between rays; the field of view is rayCount * rayAngleStep
-    int rayCount = 300;
-    int columnWidth = 3;
-    float renderDistance = 10;
-    float viewCenterAngle;
-    double playerX = 5;
-    double playerY = 2;
-    double playerAngle = 55;
-    int lastMouseX;
-    final Color RAY_COLOR = new Color(50, 100, 50, 150);
-    final Color FLOOR_COLOR = new Color(20, 20, 20, 80);
 
     //---color presets
     final FloatColor white = new FloatColor(1, 1, 1);
@@ -108,16 +148,15 @@ public class RenderPanel extends JPanel implements KeyListener, MouseListener, M
     @Override
     protected void paintComponent(Graphics g) {
         super.paintComponent(g);
-        playerAngle = playerAngle % 360;
         // Draw map grid.
         g.setColor(Color.black);
-        g.fillRect(0, 0, 1300, 500);
+        g.fillRect(0, 0, PANEL_WIDTH, PANEL_HEIGHT);
         g.setColor(Color.darkGray);
         for (int i = 1; i < GRID_SIZE; i++) {
-            g.drawLine(cellSize * i, 0, cellSize * i, getHeight());
+            g.drawLine(CELL_SIZE * i, 0, CELL_SIZE * i, MAP_SIZE);
         }
         for (int i = 1; i < GRID_SIZE; i++) {
-            g.drawLine(0, cellSize * i, 400, cellSize * i);
+            g.drawLine(0, CELL_SIZE * i, MAP_SIZE, CELL_SIZE * i);
         }
         // Draw the blocks on the map.
         for (int i = 0; i < GRID_SIZE; i++) {
@@ -130,28 +169,28 @@ public class RenderPanel extends JPanel implements KeyListener, MouseListener, M
                         FloatColor mapColor = blockTypes[blockId].mapColor;
                         g.setColor(new Color((int) (mapColor.r * 255), (int) (mapColor.g * 255), (int) (mapColor.b * 255), 255));
                     }
-                    g.fillRect(i * cellSize, j * cellSize, cellSize, cellSize);
+                    g.fillRect(i * CELL_SIZE, j * CELL_SIZE, CELL_SIZE, CELL_SIZE);
                 }
             }
         }
         // Clear the 3D view and draw the floor.
         g.setColor(Color.black);
-        g.fillRect(400, 0, 900, 500);
+        g.fillRect(VIEW_X, 0, VIEW_WIDTH, VIEW_HEIGHT);
         g.setColor(FLOOR_COLOR);
-        g.fillRect(400, 200, 900, 200);
+        g.fillRect(VIEW_X, HORIZON_Y, VIEW_WIDTH, VIEW_HEIGHT - HORIZON_Y);
         // Draw the player on the map.
         g.setColor(Color.red);
-        g.fillOval((int) (playerX * cellSize - cellSize / 4),
-                (int) (playerY * cellSize - cellSize / 4), cellSize / 2, cellSize / 2);
+        g.fillOval((int) (playerX * CELL_SIZE - CELL_SIZE / 4),
+                (int) (playerY * CELL_SIZE - CELL_SIZE / 4), CELL_SIZE / 2, CELL_SIZE / 2);
 
         // Distances of the last three rays, used to detect wall edges and corners.
         double prevPrevDist = 0;
         double prevDist = 0;
         double currentDist = 0;
-        double rayAngle = playerAngle;
-        for (int i = 0; i < rayCount; i++) {
+        for (int i = 0; i < RAY_COUNT; i++) {
 
-            rayAngle = (rayAngle + rayAngleStep) % 360;
+            // Rays fan out evenly on both sides of the direction the player faces.
+            double rayAngle = (playerAngle + (i - RAY_COUNT / 2) * rayAngleStep) % 360;
             if (rayAngle < 0)
                 rayAngle += 360;
             double rad = rayAngle * Math.PI / 180;
@@ -286,14 +325,14 @@ public class RenderPanel extends JPanel implements KeyListener, MouseListener, M
                 if (distanceFromPlayer(yStepHit.x, yStepHit.y) < distanceFromPlayer(xStepHit.x, xStepHit.y)) {
                     hitDist = distanceFromPlayer(yStepHit.x, yStepHit.y);
                     hitBlockId = yStepHit.blockId;
-                    g.drawLine((int) (playerX * cellSize), (int) (playerY * cellSize),
-                            (int) (yStepHit.x * cellSize), (int) (yStepHit.y * cellSize));
+                    g.drawLine((int) (playerX * CELL_SIZE), (int) (playerY * CELL_SIZE),
+                            (int) (yStepHit.x * CELL_SIZE), (int) (yStepHit.y * CELL_SIZE));
                     textureCoord = yStepHit.x;
                 } else {
                     hitDist = distanceFromPlayer(xStepHit.x, xStepHit.y);
                     hitBlockId = xStepHit.blockId;
-                    g.drawLine((int) (playerX * cellSize), (int) (playerY * cellSize),
-                            (int) (xStepHit.x * cellSize), (int) (xStepHit.y * cellSize));
+                    g.drawLine((int) (playerX * CELL_SIZE), (int) (playerY * CELL_SIZE),
+                            (int) (xStepHit.x * CELL_SIZE), (int) (xStepHit.y * CELL_SIZE));
                     textureCoord = xStepHit.y;
                 }
                 prevPrevDist = prevDist;
@@ -303,33 +342,31 @@ public class RenderPanel extends JPanel implements KeyListener, MouseListener, M
 
                 // A kink in the distance curve means the previous column sits on a wall edge:
                 // darken it if it is a far (inner) corner, brighten it if it is a near (outer) corner.
-                if (Math.abs((prevPrevDist - prevDist) - (currentDist - prevDist)) > 0.0003 && prevDist < renderDistance) {
+                if (Math.abs((prevPrevDist - prevDist) - (currentDist - prevDist)) > EDGE_THRESHOLD && prevDist < RENDER_DISTANCE) {
 
-                    double brightness = (renderDistance - prevDist) / renderDistance;
+                    double brightness = (RENDER_DISTANCE - prevDist) / RENDER_DISTANCE;
                     if (prevDist > currentDist & prevDist > prevPrevDist) {
-                        brightness = brightness - 0.5f;
+                        brightness = brightness - INNER_CORNER_DARKEN;
                         g.setColor(new Color(
                                 (int) ((255 * wallColor.r) * brightness),
                                 (int) ((255 * wallColor.g) * brightness),
                                 (int) ((255 * wallColor.b) * brightness),
-                                (int) (200 * brightness)));
-                        g.fillRect(400 + ((i - 1) * columnWidth), 200 - (400 - ((int) (prevDist * 35))) / 2, columnWidth,
-                                400 - ((int) (prevDist * 35)));
+                                (int) (INNER_CORNER_ALPHA * brightness)));
+                        drawWallColumn(g, i - 1, prevDist);
                     } else if (prevDist < currentDist & prevDist < prevPrevDist) {
-                        brightness += 0.05f;
+                        brightness += OUTER_CORNER_BRIGHTEN;
                         g.setColor(new Color(
                                 (int) ((255 * wallColor.r) * brightness),
                                 (int) ((255 * wallColor.g) * brightness),
                                 (int) ((255 * wallColor.b) * brightness),
                                 (int) (255 * brightness)));
-                        g.fillRect(400 + ((i - 1) * columnWidth), 200 - (400 - ((int) (prevDist * 35))) / 2, columnWidth,
-                                400 - ((int) (prevDist * 35)));
+                        drawWallColumn(g, i - 1, prevDist);
                     }
                 }
 
                 // Draw this ray's wall column, fading to black with distance.
-                if (hitDist < renderDistance) {
-                    double brightness = (renderDistance - hitDist) / renderDistance;
+                if (hitDist < RENDER_DISTANCE) {
+                    double brightness = (RENDER_DISTANCE - hitDist) / RENDER_DISTANCE;
                     g.setColor(new Color(
                             (int) ((255 * wallColor.r) * brightness),
                             (int) ((255 * wallColor.g) * brightness),
@@ -338,20 +375,73 @@ public class RenderPanel extends JPanel implements KeyListener, MouseListener, M
                 } else
                     g.setColor(Color.BLACK);
 
-                g.fillRect(400 + (i * columnWidth), 200 - (400 - ((int) (hitDist * 35))) / 2, columnWidth,
-                        400 - ((int) (hitDist * 35)));
+                drawWallColumn(g, i, hitDist);
 
             } catch (Exception e) {}
         }
-        viewCenterAngle = ((float) (playerAngle + rayCount * (rayAngleStep / 2))) % 360;
         // Crosshair.
         g.setColor(Color.pink);
-        g.fillRect(400 + (rayCount / 2) * columnWidth - 1, 199, 2, 2);
+        g.fillRect(VIEW_X + (RAY_COUNT / 2) * COLUMN_WIDTH - 1, HORIZON_Y - 1, 2, 2);
 
+    }
+
+    // Draws screen column `column` of the 3D view for a wall `distance` cells away.
+    private void drawWallColumn(Graphics g, int column, double distance) {
+        int height = VIEW_HEIGHT - (int) (distance * WALL_SHRINK_PER_CELL);
+        g.fillRect(VIEW_X + column * COLUMN_WIDTH, HORIZON_Y - height / 2, COLUMN_WIDTH, height);
     }
 
     public double distanceFromPlayer(double x, double y) {
         return Math.sqrt(Math.pow((playerX - x), 2) + Math.pow((playerY - y), 2));
+    }
+
+    // Runs every TICK_MS: applies the held movement and turning keys.
+    private void tick() {
+        long now = System.nanoTime();
+        double seconds = Math.min((now - lastTickNanos) / 1e9, MAX_TICK_SECONDS);
+        lastTickNanos = now;
+        if (!heldKeys.isEmpty() && update(seconds))
+            repaint();
+    }
+
+    // Moves and turns the player for `seconds` of held keys. Returns true if anything changed.
+    boolean update(double seconds) {
+        double turn = 0;
+        if (isHeld(KeyEvent.VK_J, KeyEvent.VK_LEFT)) turn -= 1;
+        if (isHeld(KeyEvent.VK_L, KeyEvent.VK_RIGHT)) turn += 1;
+        double forward = 0;
+        if (isHeld(KeyEvent.VK_W, KeyEvent.VK_UP)) forward += 1;
+        if (isHeld(KeyEvent.VK_S, KeyEvent.VK_DOWN)) forward -= 1;
+        double strafe = 0;
+        if (isHeld(KeyEvent.VK_D)) strafe += 1;
+        if (isHeld(KeyEvent.VK_A)) strafe -= 1;
+        if (turn == 0 && forward == 0 && strafe == 0)
+            return false;
+
+        turnBy(turn * TURN_SPEED * seconds);
+
+        if (forward != 0 || strafe != 0) {
+            double rad = Math.toRadians(playerAngle);
+            // Divide by the input's length so moving diagonally isn't faster.
+            double step = MOVE_SPEED * seconds / Math.hypot(forward, strafe);
+            double dx = (Math.cos(rad) * forward - Math.sin(rad) * strafe) * step;
+            double dy = (Math.sin(rad) * forward + Math.cos(rad) * strafe) * step;
+            // Move on each axis separately so the player slides along walls.
+            if (isFree(playerX + dx, playerY)) playerX += dx;
+            if (isFree(playerX, playerY + dy)) playerY += dy;
+        }
+        return true;
+    }
+
+    private boolean isHeld(int... keyCodes) {
+        for (int keyCode : keyCodes)
+            if (heldKeys.contains(keyCode))
+                return true;
+        return false;
+    }
+
+    private void turnBy(double degrees) {
+        playerAngle = ((playerAngle + degrees) % 360 + 360) % 360;
     }
 
     @Override
@@ -359,82 +449,22 @@ public class RenderPanel extends JPanel implements KeyListener, MouseListener, M
 
     @Override
     public void keyPressed(KeyEvent e) {
-        switch (e.getKeyChar()) {
-            case 'L':
-            case 'l':
-                playerAngle += 5;
-                playerAngle = playerAngle % 360;
+        heldKeys.add(e.getKeyCode());
+        switch (e.getKeyCode()) {
+            case KeyEvent.VK_M:
+                rayAngleStep += FOV_CHANGE;
+                repaint();
                 break;
-            case 'J':
-            case 'j':
-                playerAngle -= 5;
-                playerAngle = playerAngle % 360;
-                break;
-            case 'w':
-            case 'W':
-                move(Direction.FORWARD);
-                break;
-            case 's':
-            case 'S':
-                move(Direction.BACK);
-                break;
-            case 'a':
-            case 'A':
-                move(Direction.LEFT);
-                break;
-            case 'd':
-            case 'D':
-                move(Direction.RIGHT);
-                break;
-            case 'm':
-                rayAngleStep += 0.05f;
-                break;
-            case 'n':
-                rayAngleStep -= 0.05f;
+            case KeyEvent.VK_N:
+                rayAngleStep = Math.max(MIN_RAY_ANGLE_STEP, rayAngleStep - FOV_CHANGE);
+                repaint();
                 break;
         }
-        repaint();
     }
 
-    private void move(Direction direction) {
-        double moveSpeed = 0.25;
-
-        double normalizedAngle = (viewCenterAngle % 360 + 360) % 360;
-        double rad = Math.toRadians(normalizedAngle);
-
-        double cosA = Math.cos(rad);
-        double sinA = Math.sin(rad);
-
-        // Move on each axis separately so the player slides along walls.
-        switch (direction) {
-            case FORWARD:
-                double nextX = playerX + cosA * moveSpeed;
-                double nextY = playerY + sinA * moveSpeed;
-                if (isFree(nextX, playerY)) playerX = nextX;
-                if (isFree(playerX, nextY)) playerY = nextY;
-                break;
-
-            case BACK:
-                double backX = playerX - cosA * moveSpeed;
-                double backY = playerY - sinA * moveSpeed;
-                if (isFree(backX, playerY)) playerX = backX;
-                if (isFree(playerX, backY)) playerY = backY;
-                break;
-
-            case LEFT:
-                double leftX = playerX + sinA * moveSpeed;
-                double leftY = playerY - cosA * moveSpeed;
-                if (isFree(leftX, playerY)) playerX = leftX;
-                if (isFree(playerX, leftY)) playerY = leftY;
-                break;
-
-            case RIGHT:
-                double rightX = playerX - sinA * moveSpeed;
-                double rightY = playerY + cosA * moveSpeed;
-                if (isFree(rightX, playerY)) playerX = rightX;
-                if (isFree(playerX, rightY)) playerY = rightY;
-                break;
-        }
+    @Override
+    public void keyReleased(KeyEvent e) {
+        heldKeys.remove(e.getKeyCode());
     }
 
     // Picks the texture stripe for where along the wall face the ray hit.
@@ -448,10 +478,8 @@ public class RenderPanel extends JPanel implements KeyListener, MouseListener, M
 
     // True if a small square around (x, y) touches no wall.
     private boolean isFree(double x, double y) {
-        double radius = 0.05;
-
-        for (double xOff = -radius; xOff <= radius; xOff += radius * 2) {
-            for (double yOff = -radius; yOff <= radius; yOff += radius * 2) {
+        for (double xOff = -PLAYER_RADIUS; xOff <= PLAYER_RADIUS; xOff += PLAYER_RADIUS * 2) {
+            for (double yOff = -PLAYER_RADIUS; yOff <= PLAYER_RADIUS; yOff += PLAYER_RADIUS * 2) {
 
                 int gridX = (int) Math.floor(x + xOff);
                 int gridY = (int) Math.floor(y + yOff);
@@ -467,36 +495,35 @@ public class RenderPanel extends JPanel implements KeyListener, MouseListener, M
     }
 
     @Override
-    public void keyReleased(KeyEvent e) {}
-
-    @Override
     public void mouseClicked(MouseEvent e) {}
 
     @Override
     public void mousePressed(MouseEvent e) {
-        if (e.getX() < 400) {
-            int x = e.getX() / cellSize;
-            int y = e.getY() / cellSize;
+        requestFocusInWindow();
+        if (e.getX() < MAP_SIZE && e.getY() < MAP_SIZE) {
+            int x = e.getX() / CELL_SIZE;
+            int y = e.getY() / CELL_SIZE;
             if (e.getButton() == MouseEvent.BUTTON1) {
                 // Left click cycles the cell through the block types.
                 map[x + y * GRID_SIZE] = (map[x + y * GRID_SIZE] + 1) % blockTypes.length;
             } else if (e.getButton() == MouseEvent.BUTTON3) {
                 // Right click clears the cell.
                 map[x + y * GRID_SIZE] = 0;
-            } else if (e.getButton() == MouseEvent.BUTTON2) {
-                // Middle click teleports the player.
-                playerX = x;
-                playerY = y;
+            } else if (e.getButton() == MouseEvent.BUTTON2 && map[x + y * GRID_SIZE] == 0) {
+                // Middle click teleports the player to the middle of an empty cell.
+                playerX = x + 0.5;
+                playerY = y + 0.5;
             }
         }
+        // Dragging only turns the view when it starts in the 3D view, so editing the map doesn't spin you around.
+        turningWithMouse = e.getX() >= VIEW_X;
         lastMouseX = e.getX();
         repaint();
     }
 
     @Override
     public void mouseReleased(MouseEvent e) {
-        lastMouseX = e.getX();
-        repaint();
+        turningWithMouse = false;
     }
 
     @Override
@@ -507,8 +534,10 @@ public class RenderPanel extends JPanel implements KeyListener, MouseListener, M
 
     @Override
     public void mouseDragged(MouseEvent e) {
-        // Dragging the mouse turns the view.
-        playerAngle = (playerAngle + ((lastMouseX - e.getX()) / GRID_SIZE)) % 360;
+        if (!turningWithMouse)
+            return;
+        // Drag the view like grabbing the scene: drag left to look right.
+        turnBy((lastMouseX - e.getX()) * MOUSE_TURN_PER_PIXEL);
         lastMouseX = e.getX();
         repaint();
     }

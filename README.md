@@ -26,15 +26,19 @@ The renderer uses **ray casting**, the technique behind the classic early-90s fi
 
 ## Controls
 
+Hold the keys to move and turn smoothly. You can combine them, for example to walk and turn at the
+same time.
+
 | Input | Action |
 | --- | --- |
 | `W` `A` `S` `D` | Move forward, left, back, right |
-| `J` / `L` | Turn left / right |
-| Drag the mouse | Turn |
+| `↑` / `↓` | Move forward / back |
+| `J` `L` or `←` `→` | Turn left / right |
+| Drag in the 3D view | Turn |
 | `N` / `M` | Narrow / widen the field of view |
 | Left click on the map | Place a block, or cycle the cell through the block types |
 | Right click on the map | Remove a block |
-| Middle click on the map | Teleport the player |
+| Middle click on the map | Teleport the player to that cell |
 
 ## Running it
 
