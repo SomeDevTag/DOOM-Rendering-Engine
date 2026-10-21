@@ -7,6 +7,8 @@ The window is split in two: on the left is a top-down editor of the level, and o
 first-person view, drawn live from that map. There are no game engine or graphics libraries involved,
 only `java.awt.Graphics` drawing rectangles.
 
+![The map editor on the left with the rays fanning out from the player, and the first-person view on the right](screenshot.png)
+
 ## How it works
 
 The renderer uses **ray casting**, the technique behind the classic early-90s first-person shooters.
